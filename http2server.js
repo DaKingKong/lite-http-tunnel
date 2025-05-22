@@ -1,9 +1,8 @@
 const http2 = require('http2');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const { expressBridge } = require('http2-express-bridge');
-const spdy = require('spdy');
 const morgan = require('morgan');
 const { v4: uuidV4 } = require('uuid');
 const { Server } = require('socket.io');
@@ -16,25 +15,32 @@ const { TunnelRequest, TunnelResponse, HTTP2TunnelRequest, HTTP2TunnelResponse }
 // Create Express app
 const app = express();
 
-// Create HTTP/2 server
-// For development environments, you can use self-signed certs
-// For production, replace these with proper certificates
-const options = {
-  key: process.env.SSL_KEY_PATH ? fs.readFileSync(process.env.SSL_KEY_PATH) : undefined,
-  cert: process.env.SSL_CERT_PATH ? fs.readFileSync(process.env.SSL_CERT_PATH) : undefined,
-  spdy: {
-    protocols: ['h2', 'http/1.1'],
-    plain: !process.env.SSL_KEY_PATH || !process.env.SSL_CERT_PATH,
-    ssl: !!process.env.SSL_KEY_PATH && !!process.env.SSL_CERT_PATH,
-  }
-};
+// Create separate HTTP/1.1 and HTTP/2 servers
+let httpServer;
+let http2Server;
 
-// Use SPDY as a fallback when HTTP/2 module isn't suitable
-const server = spdy.createServer(options, expressBridge(app));
+// For HTTP/2
+if (process.env.SSL_KEY_PATH && process.env.SSL_CERT_PATH) {
+  const options = {
+    key: fs.readFileSync(process.env.SSL_KEY_PATH),
+    cert: fs.readFileSync(process.env.SSL_CERT_PATH),
+    allowHTTP1: true // Allow HTTP/1 connections on the same port
+  };
+  
+  // Create HTTP/2 server
+  http2Server = http2.createSecureServer(options);
+  httpServer = http2Server;
+  
+  console.log('Using HTTP/2 server with SSL');
+} else {
+  // Fallback to HTTP/1.1 server if no SSL certs
+  httpServer = http.createServer();
+  console.log('Using HTTP/1.1 server (no SSL certificates provided)');
+}
 
 // Socket.io configuration
 const webTunnelPath = '/$web_tunnel';
-const io = new Server(server, {
+const io = new Server(httpServer, {
   path: webTunnelPath,
 });
 
@@ -158,11 +164,12 @@ app.get('/tunnel_jwt_generator', (req, res) => {
 
 // Helper function to get request headers
 function getReqHeaders(req) {
-  const encrypted = !!(req.isSpdy || req.connection.encrypted || req.connection.pair);
+  const encrypted = !!(req.socket.encrypted);
   const headers = { ...req.headers };
-  const url = new URL(`${encrypted ? 'https' : 'http'}://${req.headers.host}`);
+  const host = headers.host || '';
+  const url = new URL(`${encrypted ? 'https' : 'http'}://${host}`);
   const forwardValues = {
-    for: req.connection?.remoteAddress || req.socket?.remoteAddress,
+    for: req.socket?.remoteAddress,
     port: url.port || (encrypted ? 443 : 80),
     proto: encrypted ? 'https' : 'http',
   };
@@ -171,16 +178,16 @@ function getReqHeaders(req) {
     headers[`x-forwarded-${key}`] =
       `${previousValue || ''}${previousValue ? ',' : ''}${forwardValues[key]}`;
   });
-  headers['x-forwarded-host'] = req.headers['x-forwarded-host'] || req.headers.host || '';
+  headers['x-forwarded-host'] = req.headers['x-forwarded-host'] || host || '';
   return headers;
 }
 
-// Main HTTP/1.1 request handler
-app.use('/', (req, res) => {
+// Main request handler
+function handleRequest(req, res) {
   const tunnelSocketObj = getAvailableTunnelSocket(req.headers.host, req.url);
   if (!tunnelSocketObj) {
-    res.status(404);
-    res.send('Not Found');
+    res.statusCode = 404;
+    res.end('Not Found');
     return;
   }
 
@@ -199,7 +206,7 @@ app.use('/', (req, res) => {
   } else {
     handleHTTP1Request(req, res, tunnelSocket, requestId);
   }
-});
+}
 
 function handleHTTP1Request(req, res, tunnelSocket, requestId) {
   const tunnelRequest = new TunnelRequest({
@@ -220,7 +227,7 @@ function handleHTTP1Request(req, res, tunnelSocket, requestId) {
   req.once('error', onReqError);
   req.pipe(tunnelRequest);
   
-  req.once('finish', () => {
+  req.once('end', () => {
     req.off('aborted', onReqError);
     req.off('error', onReqError);
   });
@@ -233,7 +240,7 @@ function handleHTTP1Request(req, res, tunnelSocket, requestId) {
   const onRequestError = () => {
     tunnelResponse.off('response', onResponse);
     tunnelResponse.destroy();
-    res.status(502);
+    res.statusCode = 502;
     res.end('Request error');
   };
   
@@ -248,7 +255,8 @@ function handleHTTP1Request(req, res, tunnelSocket, requestId) {
   
   const onSocketError = () => {
     res.off('close', onResClose);
-    res.end(500);
+    res.statusCode = 500;
+    res.end();
   };
   
   const onResClose = () => {
@@ -279,7 +287,7 @@ function handleHTTP2Request(req, res, tunnelSocket, requestId) {
   req.once('error', onReqError);
   req.pipe(tunnelRequest);
   
-  req.once('finish', () => {
+  req.once('end', () => {
     req.off('aborted', onReqError);
     req.off('error', onReqError);
   });
@@ -292,7 +300,7 @@ function handleHTTP2Request(req, res, tunnelSocket, requestId) {
   const onRequestError = () => {
     tunnelResponse.off('response', onResponse);
     tunnelResponse.destroy();
-    res.status(502);
+    res.statusCode = 502;
     res.end('Request error');
   };
   
@@ -311,7 +319,8 @@ function handleHTTP2Request(req, res, tunnelSocket, requestId) {
   
   const onSocketError = () => {
     res.off('close', onResClose);
-    res.end(500);
+    res.statusCode = 500;
+    res.end();
   };
   
   const onResClose = () => {
@@ -323,7 +332,24 @@ function handleHTTP2Request(req, res, tunnelSocket, requestId) {
 }
 
 // WebSocket handling
-server.on('upgrade', (req, socket, head) => {
+function createSocketHttpHeader(line, headers) {
+  return Object.keys(headers).reduce(function (head, key) {
+    var value = headers[key];
+
+    if (!Array.isArray(value)) {
+      head.push(key + ': ' + value);
+      return head;
+    }
+
+    for (var i = 0; i < value.length; i++) {
+      head.push(key + ': ' + value[i]);
+    }
+    return head;
+  }, [line])
+  .join('\r\n') + '\r\n\r\n';
+}
+
+function handleUpgrade(req, socket, head) {
   if (req.url.indexOf(webTunnelPath) === 0) {
     return;
   }
@@ -405,27 +431,39 @@ server.on('upgrade', (req, socket, head) => {
   
   tunnelResponse.once('requestError', onRequestError);
   tunnelResponse.once('response', onResponse);
-});
+}
 
-function createSocketHttpHeader(line, headers) {
-  return Object.keys(headers).reduce(function (head, key) {
-    var value = headers[key];
-
-    if (!Array.isArray(value)) {
-      head.push(key + ': ' + value);
-      return head;
+// For HTTP/1.1 - attach our express app
+if (!http2Server) {
+  httpServer.on('request', app);
+  httpServer.on('request', handleRequest);
+  httpServer.on('upgrade', handleUpgrade);
+} else {
+  // For HTTP/2 server
+  http2Server.on('request', (req, res) => {
+    // Check if it's an express route
+    const expressHandler = app._router.stack.some(layer => {
+      if (!layer.route) return false;
+      return layer.route.path === req.url;
+    });
+    
+    if (expressHandler) {
+      app(req, res);
+    } else {
+      handleRequest(req, res);
     }
-
-    for (var i = 0; i < value.length; i++) {
-      head.push(key + ': ' + value[i]);
-    }
-    return head;
-  }, [line])
-  .join('\r\n') + '\r\n\r\n';
+  });
+  
+  // For WebSocket upgrade in HTTP/2
+  http2Server.on('upgrade', handleUpgrade);
 }
 
 // Start server
 const port = process.env.PORT || 3000;
-server.listen(port, () => {
-  console.log(`HTTP/2 and HTTP/1.1 server listening on port ${port}`);
+httpServer.listen(port, '0.0.0.0', () => {
+  if (http2Server) {
+    console.log(`HTTP/2 server listening on port ${port} on all interfaces`);
+  } else {
+    console.log(`HTTP/1.1 server listening on port ${port} on all interfaces`);
+  }
 }); 

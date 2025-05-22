@@ -16,7 +16,7 @@ Firstly please deploy this project to your own web host with public internet acc
 
 #### For HTTP/2 and gRPC Support
 
-For HTTP/2 and gRPC support, use the `http2server.js` file instead of `server.js`. This requires additional configuration for SSL certificates:
+For HTTP/2 and gRPC support, use the `http2server.js` file instead of `server.js`. This requires SSL certificates since HTTP/2 generally requires HTTPS:
 
 ```shell
 # Set environment variables for SSL certificates (required for HTTP/2)
@@ -24,7 +24,7 @@ export SSL_KEY_PATH=/path/to/your/key.pem
 export SSL_CERT_PATH=/path/to/your/cert.pem
 
 # Start the HTTP/2 compatible server
-node http2server.js
+npm run start:http2
 ```
 
 For development or testing, you can generate self-signed certificates:
@@ -33,6 +33,8 @@ For development or testing, you can generate self-signed certificates:
 # Generate self-signed certificates for local testing
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
 ```
+
+If SSL certificates are not provided, the server will fall back to HTTP/1.1 mode, but will still be able to handle WebSocket tunneling. Note that gRPC requires HTTP/2, so you'll need valid SSL certificates for gRPC tunneling.
 
 #### Deploy to Heroku with following button
 
@@ -110,17 +112,21 @@ $ lite-http-tunnel start your_local_server_port -h localhost1
 
 To use the HTTP/2 and gRPC tunneling capabilities, you'll need to:
 
-1. Run the HTTP/2 compatible server (`http2server.js`)
+1. Run the HTTP/2 compatible server (`http2server.js`) with valid SSL certificates
 2. Use the HTTP/2 compatible client
 
 We provide an example HTTP/2 client implementation in `http2client-example.js` that you can use as a reference:
 
 ```shell
+# Install required dependencies
+npm install socket.io-client
+
 # Set environment variables
 export TUNNEL_SERVER_URL=https://your-tunnel-server.com
 export TUNNEL_AUTH_TOKEN=your-jwt-token
 export LOCAL_PORT=50051  # Your local gRPC/HTTP2 server port
 export PATH_PREFIX=/api   # Optional path prefix
+export DEBUG=true        # Enable detailed logging
 
 # Run the HTTP/2 compatible client
 node http2client-example.js
