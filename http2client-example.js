@@ -24,7 +24,9 @@ const config = {
   // Local server host
   localHost: process.env.LOCAL_HOST || 'localhost',
   // Debug mode
-  debug: process.env.DEBUG === 'true'
+  debug: process.env.DEBUG === 'true',
+  // Insecure (skip SSL validation for local connections)
+  insecure: process.env.INSECURE === 'true'
 };
 
 // Log function that respects debug mode
@@ -43,7 +45,11 @@ const socket = io(config.serverUrl, {
   extraHeaders: {
     'path-prefix': config.pathPrefix,
     'supports-http2': 'true' // Signal to server that this client supports HTTP/2
-  }
+  },
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000
 });
 
 // Keep track of active requests
@@ -55,36 +61,66 @@ let localClient;
 function createLocalClient() {
   log('Creating local HTTP/2 client connection');
   
-  // Connect to local server
-  localClient = http2.connect(`http://${config.localHost}:${config.localPort}`);
-  
-  localClient.on('error', (err) => {
-    console.error('Local HTTP/2 client error:', err);
-    // Try to reconnect after a brief delay
+  try {
+    // Connect to local server with http2
+    const clientOptions = {
+      rejectUnauthorized: !config.insecure // Skip SSL validation if requested
+    };
+    
+    log(`Connecting to ${config.localHost}:${config.localPort}`);
+    // First try HTTPS/HTTP2 secure connection
+    try {
+      localClient = http2.connect(`https://${config.localHost}:${config.localPort}`, clientOptions);
+      log('Connected using HTTPS/HTTP2');
+    } catch (err) {
+      log('HTTPS connection failed, trying HTTP:', err.message);
+      // Fallback to HTTP/2 cleartext
+      localClient = http2.connect(`http://${config.localHost}:${config.localPort}`);
+      log('Connected using HTTP/HTTP2');
+    }
+    
+    localClient.on('error', (err) => {
+      console.error('Local HTTP/2 client error:', err);
+      localClient = null;
+      // Try to reconnect after a brief delay
+      setTimeout(() => {
+        createLocalClient();
+      }, 1000);
+    });
+    
+    localClient.on('close', () => {
+      log('Local HTTP/2 client connection closed');
+      localClient = null;
+      setTimeout(() => {
+        createLocalClient();
+      }, 1000);
+    });
+    
+    localClient.on('connect', () => {
+      log('Local HTTP/2 client connected successfully');
+    });
+    
+    // Set a longer timeout to prevent premature closing
+    localClient.setTimeout(0); // Disable timeout
+  } catch (err) {
+    console.error('Failed to create HTTP/2 client:', err);
+    localClient = null;
     setTimeout(() => {
       createLocalClient();
-    }, 1000);
-  });
-  
-  localClient.on('close', () => {
-    log('Local HTTP/2 client connection closed');
-    setTimeout(() => {
-      createLocalClient();
-    }, 1000);
-  });
+    }, 3000);
+  }
 }
 
 // Socket.io event handlers
 socket.on('connect', () => {
   console.log('Connected to tunnel server');
-  createLocalClient();
+  if (!localClient) {
+    createLocalClient();
+  }
 });
 
 socket.on('disconnect', () => {
   console.log('Disconnected from tunnel server');
-  if (localClient) {
-    localClient.close();
-  }
 });
 
 // Handle HTTP/2 requests from tunnel server
@@ -92,13 +128,33 @@ socket.on('http2-request', (requestId, request) => {
   log('Received HTTP/2 request', requestId, request.path);
   
   if (!localClient || localClient.destroyed) {
+    log('Local HTTP/2 client not connected, reconnecting...');
+    createLocalClient();
     socket.emit('http2-request-error', requestId, 'Local HTTP/2 client not connected');
     return;
   }
   
   try {
+    // Special handling for gRPC
+    const isGrpc = request.headers['content-type']?.includes('application/grpc');
+    log('Is gRPC request:', isGrpc);
+    
     // Convert headers to HTTP/2 format
     const headers = convertHTTP1HeadersToHTTP2(request.headers, request.method, request.path);
+    
+    // Add special headers for gRPC if needed
+    if (isGrpc) {
+      headers['te'] = 'trailers';
+      // Check for grpc-encoding and other grpc headers and include them
+      for (const [key, value] of Object.entries(request.headers)) {
+        if (key.toLowerCase().startsWith('grpc-')) {
+          headers[key] = value;
+        }
+      }
+    }
+    
+    // Log the headers we're sending to local server
+    log('Converted headers:', headers);
     
     // Create a new stream for this request
     const stream = localClient.request(headers);
@@ -108,27 +164,36 @@ socket.on('http2-request', (requestId, request) => {
     
     // Handle response headers
     stream.once('response', (headers) => {
-      log('Received HTTP/2 response headers for', requestId);
+      log('Received HTTP/2 response headers for', requestId, headers);
       
       // Convert HTTP/2 headers to HTTP/1.1 for tunneling
       const responseHeaders = convertHTTP2HeadersToHTTP1(headers);
       let statusCode = 200;
-      let statusMessage = 'OK';
       
       if (headers[':status']) {
         statusCode = parseInt(headers[':status'], 10);
       }
       
+      // For gRPC, pass through all grpc-* headers
+      if (isGrpc) {
+        for (const [key, value] of Object.entries(headers)) {
+          if (key.toLowerCase().startsWith('grpc-')) {
+            responseHeaders[key] = value;
+          }
+        }
+      }
+      
       // Send response headers back through tunnel
       socket.emit('http2-response', requestId, {
         statusCode,
-        statusMessage,
+        statusMessage: http2.constants.HTTP_STATUS_CODES[statusCode] || 'OK',
         headers: responseHeaders
       });
     });
     
     // Forward response data back through tunnel
     stream.on('data', (chunk) => {
+      log('Received data chunk from local server for', requestId, 'size:', chunk.length);
       socket.emit('http2-response-pipe', requestId, chunk);
     });
     
@@ -146,11 +211,22 @@ socket.on('http2-request', (requestId, request) => {
       activeRequests.delete(requestId);
     });
     
-    // For POST, PUT etc. requests, we need to handle request body
-    stream.on('wantTrailers', () => {
-      log('Stream wants trailers for', requestId);
-      // Indicate no trailers are coming
-      stream.close();
+    // Handle trailers - important for gRPC
+    stream.on('trailers', (headers) => {
+      log('Received trailers for', requestId, headers);
+      // We can't send these directly as trailers in the tunneling protocol,
+      // but for gRPC they contain important status information, so we include
+      // them in the last data chunk with special marker
+      
+      const trailersObj = {};
+      for (const [key, value] of Object.entries(headers)) {
+        trailersObj[key] = value;
+      }
+      
+      if (Object.keys(trailersObj).length > 0) {
+        // Send trailers as a special message
+        socket.emit('http2-response-trailers', requestId, trailersObj);
+      }
     });
   } catch (err) {
     console.error('Error creating HTTP/2 request:', err);
@@ -162,8 +238,17 @@ socket.on('http2-request', (requestId, request) => {
 socket.on('http2-request-pipe', (requestId, chunk) => {
   const stream = activeRequests.get(requestId);
   if (stream) {
-    log('Writing chunk to stream for', requestId, chunk.length, 'bytes');
-    stream.write(chunk);
+    log('Writing chunk to stream for', requestId, 'size:', chunk.length);
+    // Need to handle backpressure
+    const success = stream.write(chunk);
+    if (!success) {
+      // If write returned false, we need to wait for drain
+      stream.once('drain', () => {
+        log('Stream drained for', requestId);
+      });
+    }
+  } else {
+    log('Stream not found for', requestId);
   }
 });
 
@@ -172,8 +257,14 @@ socket.on('http2-request-pipes', (requestId, chunks) => {
   const stream = activeRequests.get(requestId);
   if (stream) {
     for (const chunk of chunks) {
-      log('Writing chunk to stream for', requestId, chunk.length, 'bytes');
-      stream.write(chunk);
+      log('Writing chunk to stream for', requestId, 'size:', chunk.length);
+      const success = stream.write(chunk);
+      if (!success) {
+        stream.once('drain', () => {
+          log('Stream drained for', requestId);
+        });
+        break;  // Stop writing more chunks until we get a drain event
+      }
     }
   }
 });
@@ -202,6 +293,8 @@ socket.on('request', (requestId, request) => {
   log('Received HTTP/1.1 request', requestId, request.path);
   
   if (!localClient || localClient.destroyed) {
+    log('Local HTTP/2 client not connected, attempting reconnection');
+    createLocalClient();
     socket.emit('request-error', requestId, 'Local HTTP/2 client not connected');
     return;
   }
@@ -223,7 +316,6 @@ socket.on('request', (requestId, request) => {
       // Convert HTTP/2 headers to HTTP/1.1 for tunneling
       const responseHeaders = convertHTTP2HeadersToHTTP1(headers);
       let statusCode = 200;
-      let statusMessage = 'OK';
       
       if (headers[':status']) {
         statusCode = parseInt(headers[':status'], 10);
@@ -232,7 +324,7 @@ socket.on('request', (requestId, request) => {
       // Send response headers back through tunnel
       socket.emit('response', requestId, {
         statusCode,
-        statusMessage,
+        statusMessage: http2.constants.HTTP_STATUS_CODES[statusCode] || 'OK',
         headers: responseHeaders
       });
     });
@@ -317,7 +409,13 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
+// Report status
 console.log(`HTTP/2 tunnel client started for ${config.localHost}:${config.localPort}`);
 if (config.pathPrefix) {
   console.log(`Path prefix: ${config.pathPrefix}`);
-} 
+}
+console.log(`Debug mode: ${config.debug ? 'enabled' : 'disabled'}`);
+console.log(`Insecure mode: ${config.insecure ? 'enabled' : 'disabled'} (SSL validation ${config.insecure ? 'disabled' : 'enabled'})`);
+
+// Create initial connection
+createLocalClient(); 

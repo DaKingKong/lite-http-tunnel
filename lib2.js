@@ -49,6 +49,7 @@ class HTTP2TunnelResponse extends Duplex {
     super();
     this._socket = socket;
     this._responseId = responseId;
+    this._trailers = null;
     
     const onResponse = (responseId, data) => {
       if (this._responseId === responseId) {
@@ -85,6 +86,7 @@ class HTTP2TunnelResponse extends Duplex {
       this._socket.off('http2-response-pipes', onResponsePipes);
       this._socket.off('http2-response-pipe-error', onResponsePipeError);
       this._socket.off('http2-response-pipe-end', onResponsePipeEnd);
+      this._socket.off('http2-response-trailers', onResponseTrailers);
       this.destroy(new Error(error));
     };
     
@@ -95,11 +97,25 @@ class HTTP2TunnelResponse extends Duplex {
       if (data) {
         this.push(data);
       }
+      
+      // If we have trailers, emit them as an event
+      if (this._trailers) {
+        this.emit('trailers', this._trailers);
+      }
+      
       this._socket.off('http2-response-pipe', onResponsePipe);
       this._socket.off('http2-response-pipes', onResponsePipes);
       this._socket.off('http2-response-pipe-error', onResponsePipeError);
       this._socket.off('http2-response-pipe-end', onResponsePipeEnd);
+      this._socket.off('http2-response-trailers', onResponseTrailers);
       this.push(null);
+    };
+    
+    const onResponseTrailers = (responseId, trailers) => {
+      if (this._responseId === responseId) {
+        // Store trailers to emit when the stream ends
+        this._trailers = trailers;
+      }
     };
     
     const onRequestError = (requestId, error) => {
@@ -110,6 +126,7 @@ class HTTP2TunnelResponse extends Duplex {
         this._socket.off('http2-response-pipes', onResponsePipes);
         this._socket.off('http2-response-pipe-error', onResponsePipeError);
         this._socket.off('http2-response-pipe-end', onResponsePipeEnd);
+        this._socket.off('http2-response-trailers', onResponseTrailers);
         this.emit('requestError', error);
       }
     };
@@ -119,6 +136,7 @@ class HTTP2TunnelResponse extends Duplex {
     this._socket.on('http2-response-pipes', onResponsePipes);
     this._socket.on('http2-response-pipe-error', onResponsePipeError);
     this._socket.on('http2-response-pipe-end', onResponsePipeEnd);
+    this._socket.on('http2-response-trailers', onResponseTrailers);
     this._socket.on('http2-request-error', onRequestError);
   }
 
@@ -203,7 +221,24 @@ function convertHTTP1HeadersToHTTP2(headers, method, path) {
   // Default to https scheme for HTTP/2
   result[':scheme'] = 'https';
   
+  // Special handling for gRPC - ensure content-type is properly set
+  if (headers['content-type'] && headers['content-type'].includes('application/grpc')) {
+    // Make sure content-type is preserved exactly
+    result['content-type'] = headers['content-type'];
+    
+    // Add TE:trailers header which is required for gRPC
+    result['te'] = 'trailers';
+  }
+  
   return result;
+}
+
+// Check if request headers indicate gRPC
+function isGrpcRequest(headers) {
+  return headers && 
+    (headers['content-type']?.includes('application/grpc') || 
+     headers['grpc-encoding'] || 
+     headers['grpc-accept-encoding']);
 }
 
 module.exports = {
@@ -212,5 +247,6 @@ module.exports = {
   HTTP2TunnelRequest,
   HTTP2TunnelResponse,
   convertHTTP2HeadersToHTTP1,
-  convertHTTP1HeadersToHTTP2
+  convertHTTP1HeadersToHTTP2,
+  isGrpcRequest
 }; 

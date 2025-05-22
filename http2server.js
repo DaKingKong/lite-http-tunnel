@@ -435,21 +435,38 @@ function handleUpgrade(req, socket, head) {
 
 // For HTTP/1.1 - attach our express app
 if (!http2Server) {
-  httpServer.on('request', app);
-  httpServer.on('request', handleRequest);
+  // For plain HTTP/1.1, we need to manually integrate Express
+  const originalListen = app.listen;
+  app.listen = function() {
+    return originalListen.apply(this, arguments);
+  };
+
+  // Handle Express routes first, fall back to tunnel handler
+  httpServer.on('request', (req, res) => {
+    // Check if it's an express route
+    const expressRoute = req.url === '/tunnel_jwt_generator';
+    
+    if (expressRoute) {
+      // This is for Express to handle
+      app(req, res);
+    } else {
+      // This is for our tunnel handler
+      handleRequest(req, res);
+    }
+  });
+  
   httpServer.on('upgrade', handleUpgrade);
 } else {
   // For HTTP/2 server
   http2Server.on('request', (req, res) => {
     // Check if it's an express route
-    const expressHandler = app._router.stack.some(layer => {
-      if (!layer.route) return false;
-      return layer.route.path === req.url;
-    });
+    const expressRoute = req.url === '/tunnel_jwt_generator';
     
-    if (expressHandler) {
+    if (expressRoute) {
+      // This is for Express to handle
       app(req, res);
     } else {
+      // This is for our tunnel handler
       handleRequest(req, res);
     }
   });
