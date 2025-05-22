@@ -1,18 +1,38 @@
 # Lite HTTP Tunnel
 
-A tunnel tool to help you expose local web (HTTP/WebSocket) server behind a NAT or firewall to the internet. Inspired by [Ngrok](https://github.com/inconshreveable/ngrok) and [node-http-proxy](https://github.com/http-party/node-http-proxy).
+A tunnel tool to help you expose local web (HTTP/WebSocket/HTTP2/gRPC) server behind a NAT or firewall to the internet. Inspired by [Ngrok](https://github.com/inconshreveable/ngrok) and [node-http-proxy](https://github.com/http-party/node-http-proxy).
 
 ![http tunnel](https://user-images.githubusercontent.com/7036536/155876708-f30f4921-c8c8-463d-8917-c4f932d3b2e6.png)
 
 ## How it work
 
-The tunnel is based on `WebSocket`. We have a `WebSocket` connection between the client and server to stream HTTP/WebSocket requests from public server to your local server.
+The tunnel is based on `WebSocket`. We have a `WebSocket` connection between the client and server to stream HTTP/WebSocket/HTTP2/gRPC requests from public server to your local server.
 
 ## Usage
 
 ### Deploy at public server
 
 Firstly please deploy this project to your own web host with public internet access. The project is just a `Node.js` web server based on `Express.js`. So just deploy as what you do for [deploying Node.js web server](https://developer.mozilla.org/en-US/docs/Learn/Server-side/Express_Nodejs/deployment).
+
+#### For HTTP/2 and gRPC Support
+
+For HTTP/2 and gRPC support, use the `http2server.js` file instead of `server.js`. This requires additional configuration for SSL certificates:
+
+```shell
+# Set environment variables for SSL certificates (required for HTTP/2)
+export SSL_KEY_PATH=/path/to/your/key.pem
+export SSL_CERT_PATH=/path/to/your/cert.pem
+
+# Start the HTTP/2 compatible server
+node http2server.js
+```
+
+For development or testing, you can generate self-signed certificates:
+
+```shell
+# Generate self-signed certificates for local testing
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+```
 
 #### Deploy to Heroku with following button
 
@@ -86,6 +106,28 @@ $ lite-http-tunnel start your_local_server_port -o localhost:5000
 $ lite-http-tunnel start your_local_server_port -h localhost1
 ```
 
+### HTTP/2 and gRPC Support
+
+To use the HTTP/2 and gRPC tunneling capabilities, you'll need to:
+
+1. Run the HTTP/2 compatible server (`http2server.js`)
+2. Use the HTTP/2 compatible client
+
+We provide an example HTTP/2 client implementation in `http2client-example.js` that you can use as a reference:
+
+```shell
+# Set environment variables
+export TUNNEL_SERVER_URL=https://your-tunnel-server.com
+export TUNNEL_AUTH_TOKEN=your-jwt-token
+export LOCAL_PORT=50051  # Your local gRPC/HTTP2 server port
+export PATH_PREFIX=/api   # Optional path prefix
+
+# Run the HTTP/2 compatible client
+node http2client-example.js
+```
+
+This client can tunnel HTTP/2 traffic, including gRPC services, through the tunnel server to your local HTTP/2 server.
+
 ## Multiple Clients
 
 ### Use different domains for public server
@@ -136,4 +178,5 @@ A introduce article: [Building a HTTP Tunnel with WebSocket and Node.JS](https:/
 
 ## TODO
 
+- [x] Add HTTP/2 and gRPC support
 - [ ] Add tests
